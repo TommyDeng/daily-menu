@@ -1,0 +1,33 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "daily-menu",
+	"main": "src/entry.py",
+	"compatibility_date": "2026-10-22",
+	"compatibility_flags": [
+		"python_workers"
+	],
+	"routes": [
+		{
+			"pattern": "menu.tommydeng.org",
+			"custom_domain": true
+		}
+	],
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 1
+		}
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "daily-menu",
+			"database_id": "ea7bb57f-93ff-4cd4-80f8-48e5a8663eac"
+		}
+	]
+}
