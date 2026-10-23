@@ -1,6 +1,6 @@
 import hashlib
 import hmac
-from datetime import date
+from datetime import date, timedelta
 from html import escape
 from http.cookies import SimpleCookie
 from urllib.parse import urlparse
@@ -230,14 +230,14 @@ h1 {
 .recipe-form input:not([type="hidden"]) { grid-column: 1 / -1; }
 .field { display: grid; gap: 6px; }
 .field span { font-size: 0.8rem; color: var(--muted); font-weight: 600; }
-input[type="text"], input[type="password"], input:not([type]) {
+input[type="text"], input[type="password"], input[type="date"], input:not([type]), select {
     width: 100%;
     padding: 0.75rem 0.85rem;
     border-radius: 12px;
     border: 1px solid transparent;
     background: #f6f0e6;
 }
-input:focus {
+input:focus, select:focus {
     outline: none;
     background: #fff;
     border-color: #e7c3b4;
@@ -267,9 +267,9 @@ input:focus {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
-        "date action"
-        "main action";
-    gap: 2px 12px;
+        "date save"
+        "main delete";
+    gap: 8px 10px;
     align-items: center;
     background: var(--card);
     border: 1px solid var(--line);
@@ -277,8 +277,11 @@ input:focus {
     padding: 12px 12px 12px 16px;
 }
 .history-main { display: grid; gap: 2px; min-width: 0; grid-area: main; }
-.history-date { color: var(--muted); font-size: 0.86rem; grid-area: date; }
-.history-row .btn { grid-area: action; }
+.history-date { grid-area: date; }
+.history-row input[type="date"] { max-width: 11.5rem; padding: 0.45rem 0.55rem; }
+.history-row .save { grid-area: save; justify-self: end; }
+.history-row .danger { grid-area: delete; justify-self: end; }
+.history-row .btn { padding: 0.5rem 0.85rem; box-shadow: none; }
 .history-name {
     font-family: var(--serif);
     font-weight: 700;
@@ -317,10 +320,9 @@ input:focus {
 }
 @media (min-width: 720px) {
     .history-row {
-        grid-template-columns: 9.5rem minmax(0, 1fr) auto;
-        grid-template-areas: "date main action";
+        grid-template-columns: 11.5rem minmax(0, 1fr) auto auto;
+        grid-template-areas: "date main save delete";
     }
-    .history-date { color: var(--ink); font-size: 0.95rem; }
     .composer { grid-template-columns: 1fr 1.4fr auto; align-items: end; }
     .recipe-form {
         grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr) auto auto;
@@ -397,6 +399,16 @@ def topbar(current):
     """
 
 
+def parse_day(raw, today):
+    try:
+        parsed = date.fromisoformat(str(raw or "").strip())
+    except ValueError:
+        return ""
+    if parsed > today:
+        return ""
+    return parsed.isoformat()
+
+
 def format_day(value):
     parts = str(value).split("-")
     if len(parts) == 3 and all(part.isdigit() for part in parts):
@@ -408,13 +420,15 @@ def format_day(value):
 def format_used(value, today):
     if not value:
         return "还没吃过", "fresh"
-    if value == today:
+    try:
+        used = date.fromisoformat(str(value))
+        current = today if isinstance(today, date) else date.fromisoformat(str(today))
+    except ValueError:
+        return escape(str(value)), "used"
+    days = (current - used).days
+    if days <= 0:
         return "今天吃过", "today"
-    parts = str(value).split("-")
-    if len(parts) == 3 and all(part.isdigit() for part in parts):
-        year, month, day = (int(part) for part in parts)
-        return f"上次 {year}年{month}月{day}日", "used"
-    return f"上次 {escape(str(value))}", "used"
+    return f"{days}天前吃过", "used"
 
 
 class Default(WorkerEntrypoint):
@@ -702,36 +716,147 @@ class Default(WorkerEntrypoint):
                     "UPDATE recipe SET last_used = ("
                     "SELECT MAX(used_at) FROM usage_history WHERE recipe_id = ?"
                     ") WHERE id = ?"
-                ).bind(recipe_id, recipe_id),
+                )                .bind(recipe_id, recipe_id),
             ]
         )
 
+    def last_used_statement(self, recipe_id):
+        return self.env.DB.prepare(
+            "UPDATE recipe SET last_used = ("
+            "SELECT MAX(used_at) FROM usage_history WHERE recipe_id = ?"
+            ") WHERE id = ?"
+        ).bind(recipe_id, recipe_id)
+
+    async def add_history(self, name, raw_day, today):
+        day = parse_day(raw_day, today)
+        if not name:
+            return "请选一道菜"
+        if not day:
+            return "请选一个不晚于今天的日期"
+        found = await self.env.DB.prepare(
+            "SELECT id, name FROM recipe WHERE name = ?"
+        ).bind(name).all()
+        if not found.results:
+            return "这道菜不在菜谱里"
+        recipe = found.results[0]
+        clash = await self.env.DB.prepare(
+            "SELECT id FROM usage_history WHERE recipe_id = ? AND used_at = ?"
+        ).bind(recipe["id"], day).all()
+        if clash.results:
+            return "这天已经记过了"
+        try:
+            await self.env.DB.batch(
+                [
+                    self.env.DB.prepare(
+                        "INSERT INTO usage_history (recipe_id, name, used_at) "
+                        "VALUES (?, ?, ?)"
+                    ).bind(recipe["id"], recipe["name"], day),
+                    self.last_used_statement(recipe["id"]),
+                ]
+            )
+        except Exception as error:
+            if "UNIQUE" not in str(error):
+                raise
+            return "这天已经记过了"
+        return ""
+
+    async def change_history(self, history_id, action, raw_day, today):
+        found = await self.env.DB.prepare(
+            "SELECT id, recipe_id, name, used_at FROM usage_history WHERE id = ?"
+        ).bind(history_id).all()
+        if not found.results:
+            return ""
+        row = found.results[0]
+        recipe_id = row["recipe_id"]
+        if action == "delete":
+            statements = [
+                self.env.DB.prepare(
+                    "DELETE FROM usage_history WHERE id = ?"
+                ).bind(history_id)
+            ]
+            if recipe_id is not None:
+                statements.append(self.last_used_statement(recipe_id))
+            await self.env.DB.batch(statements)
+            return ""
+        day = parse_day(raw_day, today)
+        if not day:
+            return "请选一个不晚于今天的日期"
+        if day == row["used_at"]:
+            return ""
+        if recipe_id is None:
+            clash = await self.env.DB.prepare(
+                "SELECT id FROM usage_history "
+                "WHERE recipe_id IS NULL AND name = ? AND used_at = ? AND id != ?"
+            ).bind(row["name"], day, history_id).all()
+        else:
+            clash = await self.env.DB.prepare(
+                "SELECT id FROM usage_history "
+                "WHERE recipe_id = ? AND used_at = ? AND id != ?"
+            ).bind(recipe_id, day, history_id).all()
+        if clash.results:
+            return "这天已经记过了"
+        statements = [
+            self.env.DB.prepare(
+                "UPDATE usage_history SET used_at = ? WHERE id = ?"
+            ).bind(day, history_id)
+        ]
+        if recipe_id is not None:
+            statements.append(self.last_used_statement(recipe_id))
+        try:
+            await self.env.DB.batch(statements)
+        except Exception as error:
+            if "UNIQUE" not in str(error):
+                raise
+            return "这天已经记过了"
+        return ""
+
     async def history(self, request):
+        today = date.today()
+        today_iso = today.isoformat()
+        draft_name = ""
+        draft_day = (today - timedelta(days=1)).isoformat()
+        message = ""
         if request.method == "POST":
             form = await request.form_data()
             raw_id = str(form.get("id") or "")
             if raw_id.isdigit():
-                history_id = int(raw_id)
-                found = await self.env.DB.prepare(
-                    "SELECT recipe_id FROM usage_history WHERE id = ?"
-                ).bind(history_id).all()
-                if found.results:
-                    recipe_id = found.results[0]["recipe_id"]
-                    statements = [
-                        self.env.DB.prepare(
-                            "DELETE FROM usage_history WHERE id = ?"
-                        ).bind(history_id)
-                    ]
-                    if recipe_id is not None:
-                        statements.append(
-                            self.env.DB.prepare(
-                                "UPDATE recipe SET last_used = ("
-                                "SELECT MAX(used_at) FROM usage_history WHERE recipe_id = ?"
-                                ") WHERE id = ?"
-                            ).bind(recipe_id, recipe_id)
-                        )
-                    await self.env.DB.batch(statements)
-            return Response("", status=303, headers={"Location": "/history"})
+                message = await self.change_history(
+                    int(raw_id),
+                    form.get("action") or "",
+                    form.get("used_at"),
+                    today,
+                )
+            else:
+                draft_name = (form.get("name") or "").strip()
+                draft_day = str(form.get("used_at") or "")
+                message = await self.add_history(draft_name, draft_day, today)
+            if not message:
+                return Response("", status=303, headers={"Location": "/history"})
+
+        recipes = await self.env.DB.prepare(
+            "SELECT name FROM recipe ORDER BY name"
+        ).all()
+        options = []
+        for recipe in recipes.results:
+            current = escape(recipe["name"])
+            selected = " selected" if recipe["name"] == draft_name else ""
+            options.append(f'<option value="{current}"{selected}>{current}</option>')
+        if options:
+            composer = f"""
+            <form class="panel composer" method="post" action="/history">
+              <label class="field">
+                <span>菜</span>
+                <select name="name" required>{"".join(options)}</select>
+              </label>
+              <label class="field">
+                <span>哪一天</span>
+                <input type="date" name="used_at" required max="{today_iso}" value="{escape(draft_day)}">
+              </label>
+              <button class="btn" type="submit">补上</button>
+            </form>
+            """
+        else:
+            composer = '<p class="empty">菜谱里还没有菜。<a href="/recipes">先去添一道</a></p>'
 
         loaded = await self.env.DB.prepare(
             "SELECT usage_history.id, usage_history.used_at, usage_history.recipe_id, "
@@ -744,29 +869,37 @@ class Default(WorkerEntrypoint):
             gone = ""
             if item["recipe_id"] is None:
                 gone = '<span class="history-gone">已不在菜谱里</span>'
+            when = escape(item["used_at"] or "")
             rows.append(
                 "<li>"
                 '<form method="post" action="/history" class="history-row">'
                 f'<input type="hidden" name="id" value="{int(item["id"])}">'
-                f'<span class="history-date">{format_day(item["used_at"])}</span>'
+                f'<input class="history-date" type="date" name="used_at" required max="{today_iso}" value="{when}" aria-label="日期">'
                 '<span class="history-main">'
                 f'<span class="history-name">{escape(item["name"])}</span>'
                 f"{gone}"
                 "</span>"
-                '<button class="btn danger" type="submit" '
+                '<button class="btn ghost save" type="submit" name="action" value="update">保存</button>'
+                '<button class="btn danger" type="submit" name="action" value="delete" '
                 "onclick=\"return confirm('删除这条记录？最近使用会按剩下的记录重算。')\">删除</button>"
                 "</form></li>"
             )
         if rows:
-            catalog = f'<ul class="history">{"".join(rows)}</ul>'
+            catalog = (
+                f'<p class="section-label">已有 {len(rows)} 条</p>'
+                f'<ul class="history">{"".join(rows)}</ul>'
+            )
         else:
-            catalog = '<p class="empty">还没有记录。在今天勾上菜，再记下来。</p>'
+            catalog = '<p class="empty">还没有记录。上面可以补一天。</p>'
+        notice = f'<p class="notice" role="alert">{escape(message)}</p>' if message else ""
         body = f"""
         <div class="wrap">
           {topbar("/history")}
           <p class="eyebrow">历史</p>
           <h1>吃过的</h1>
-          <p class="lede">新的在上面。删掉一条，这道菜的最近使用会按剩下的记录重算。</p>
+          <p class="lede">忘了记的日子可以补上。改日期或删掉一条，最近使用都会重算。</p>
+          {notice}
+          {composer}
           {catalog}
         </div>
         """
