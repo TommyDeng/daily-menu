@@ -11,6 +11,20 @@
 - **历史**：按日查看、补记漏记、改日期或删除；删除菜品后的记录会标「已不在菜谱里」
 - **登录**：共享家庭口令（`MENU_PASSWORD`），Cookie 会话
 
+## 界面
+
+**今天** —— 最久没吃的排在前面，勾选后记为今天吃过。
+
+<img src="https://img.tommydeng.org/2026/10/170458-menu.png" alt="今天页面" width="720">
+
+**菜谱** —— 增删改菜名与备注。
+
+<img src="https://img.tommydeng.org/2026/10/170500-recipes.png" alt="菜谱页面" width="720">
+
+**历史** —— 按日查看、补记漏记、改日期或删除。
+
+<img src="https://img.tommydeng.org/2026/10/170502-history.png" alt="历史页面" width="720">
+
 ## 技术栈
 
 | 层 | 选型 |
